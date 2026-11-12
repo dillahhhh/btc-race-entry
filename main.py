@@ -36,6 +36,9 @@ LOOKBACK = 60            # bars for the momentum return
 ENTRY_1_BPS = 50         # first scale-in: trailing 60-bar return >= +50 bps
 ENTRY_2_BPS = 80         # second scale-in: trailing 60-bar return >= +80 bps
 EXIT_BPS = -10           # exit: trailing 60-bar return <= -10 bps
+STOP_LOSS_BPS = 80       # stop-loss: close >= 80 bps below the entry close
+STALE_BARS = 360         # a leg held this long with momentum <= +20 bps is
+STALE_EXIT_BPS = 20      # stale: exit instead of riding it flat for hours
 FALLBACK_BAR = 1000      # after this batch with no trade yet, lower ENTRY_1
 FALLBACK_ENTRY_BPS = 30
 MAX_SLIPPAGE_BPS = 1000  # 10%: far above any 1-minute move + impact, so a
@@ -44,6 +47,8 @@ MAX_SLIPPAGE_BPS = 1000  # 10%: far above any 1-minute move + impact, so a
 closes = []          # int closes of CBBTC, one per batch answered
 scaled_in = False    # True once the second scale-in has fired for this leg
 traded = False       # True once any order has been sent
+entry_px = None      # close at which the current leg was opened
+entry_seq = None     # batch at which the current leg was opened
 
 
 def trailing_return_bps(n):
@@ -56,7 +61,7 @@ def trailing_return_bps(n):
 
 
 def on_batch(state, batch):
-    global scaled_in, traded
+    global scaled_in, traded, entry_px, entry_seq
     bar = state.latest.get(SYMBOL)
     if bar is None or state.warming_up:
         return []
@@ -84,6 +89,8 @@ def on_batch(state, batch):
             if amount >= 1_000_000:
                 scaled_in = False
                 traded = True
+                entry_px = closes[-1]
+                entry_seq = state.seq
                 return [{
                     "side": "buy",
                     "symbol": SYMBOL,
@@ -102,8 +109,35 @@ def on_batch(state, batch):
             "notional_quote_units": state.cash,
             "max_slippage_bps": MAX_SLIPPAGE_BPS,
         }]
+    # Stop-loss: a sharp reversal against the entry (-80 bps) exits at once
+    # instead of waiting for the 60-bar momentum to fade.
+    if entry_px is not None and (closes[-1] - entry_px) * 10000 // entry_px <= -STOP_LOSS_BPS:
+        scaled_in = False
+        entry_px = None
+        entry_seq = None
+        return [{
+            "side": "sell",
+            "symbol": SYMBOL,
+            "qty": held.qty,
+            "max_slippage_bps": MAX_SLIPPAGE_BPS,
+        }]
+    # Stale leg: held 6+ hours while momentum never rebuilt above +20 bps.
+    # Exit instead of riding it flat for the rest of the window.
+    if (entry_seq is not None and state.seq - entry_seq >= STALE_BARS
+            and momentum <= STALE_EXIT_BPS):
+        scaled_in = False
+        entry_px = None
+        entry_seq = None
+        return [{
+            "side": "sell",
+            "symbol": SYMBOL,
+            "qty": held.qty,
+            "max_slippage_bps": MAX_SLIPPAGE_BPS,
+        }]
     if momentum <= EXIT_BPS:
         scaled_in = False
+        entry_px = None
+        entry_seq = None
         return [{
             "side": "sell",
             "symbol": SYMBOL,
